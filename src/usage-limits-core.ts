@@ -251,11 +251,22 @@ export async function keychainToken(service: string): Promise<string | null> {
       service,
       "-w",
     ]);
-    const creds = JSON.parse(stdout.trim());
-    const token = creds?.claudeAiOauth?.accessToken;
-    return typeof token === "string" && token.length >= 20 ? token : null;
+    return parseKeychainTokenOutput(stdout);
   } catch {
     return null;
+  }
+}
+
+export function parseKeychainTokenOutput(stdout: string): string | null {
+  const trimmed = stdout.trim();
+  if (trimmed.length === 0) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (typeof parsed === "string" && parsed.length >= 20) return parsed;
+    const token = parsed?.claudeAiOauth?.accessToken;
+    return typeof token === "string" && token.length >= 20 ? token : null;
+  } catch {
+    return trimmed.length >= 20 ? trimmed : null;
   }
 }
 
@@ -299,7 +310,11 @@ export async function readRawRecordFile(cacheFile: string): Promise<CacheRecord 
 }
 
 export async function writeCacheRecord(cacheFile: string, record: CacheRecord): Promise<void> {
-  await mkdir(dirname(cacheFile), { recursive: true, mode: 0o700 });
+  const dir = dirname(cacheFile);
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  try {
+    await chmod(dir, 0o700);
+  } catch {}
   await writeFile(cacheFile, JSON.stringify(record));
   await chmod(cacheFile, 0o600);
 }
@@ -348,6 +363,11 @@ async function releaseLock(lockFile: string): Promise<void> {
     const code = (error as NodeJS.ErrnoException).code;
     if (code !== "ENOENT") throw error;
   }
+}
+
+function logFetchError(context: string, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`usage-limits ${context} failed: ${message}`);
 }
 
 export async function fetchAndCacheUsage(args: FetchAndCacheArgs): Promise<void> {
@@ -428,14 +448,15 @@ export async function resolveUsageData(args: ResolveUsageArgs): Promise<Resolved
     if (acquired) {
       try {
         await args.fetchAndCache();
-      } catch {
+      } catch (error) {
+        logFetchError("sync fetch", error);
       } finally {
         if (args.lockFile) await releaseLock(args.lockFile);
       }
     }
     cache = await readCacheFile(args.cacheFile, now);
   } else if (decision === "background") {
-    args.fetchAndCache().catch(() => {});
+    args.fetchAndCache().catch((error) => logFetchError("background fetch", error));
   }
 
   return {

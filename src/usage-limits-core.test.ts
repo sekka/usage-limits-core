@@ -1,13 +1,15 @@
-import { mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   fetchAndCacheUsage,
   parseCache,
+  parseKeychainTokenOutput,
   readCacheFile,
   resolveUsageData,
   shouldFetchNow,
+  writeCacheRecord,
   type CacheRecord,
   type UsageLimits,
 } from "./usage-limits-core";
@@ -281,5 +283,62 @@ describe("resolveUsageData stampede lock", () => {
     });
 
     expect(fetches).toBe(1);
+  });
+
+  test("sync fetch 例外は stderr に記録し、non-throwing 契約を維持する", async () => {
+    const { cacheFile } = await expiredCache();
+    const originalError = console.error;
+    const errors: unknown[][] = [];
+    console.error = (...args: unknown[]) => {
+      errors.push(args);
+    };
+    try {
+      const result = await resolveUsageData({
+        cacheFile,
+        now,
+        fetchAndCache: async () => {
+          throw new Error("fetch exploded");
+        },
+      });
+
+      expect(result.data).toBeNull();
+      expect(errors.some((args) => String(args[0]).includes("usage-limits sync fetch failed"))).toBe(
+        true,
+      );
+      expect(errors.some((args) => args.some((arg) => String(arg).includes("fetch exploded")))).toBe(
+        true,
+      );
+    } finally {
+      console.error = originalError;
+    }
+  });
+});
+
+describe("keychainToken output parsing", () => {
+  test("JSON blob の claudeAiOauth.accessToken を読む", () => {
+    expect(
+      parseKeychainTokenOutput(JSON.stringify({ claudeAiOauth: { accessToken: "x".repeat(20) } })),
+    ).toBe("x".repeat(20));
+  });
+
+  test("plain string token を読む", () => {
+    expect(parseKeychainTokenOutput(`${"y".repeat(20)}\n`)).toBe("y".repeat(20));
+  });
+
+  test("短すぎる plain string は token として扱わない", () => {
+    expect(parseKeychainTokenOutput("short-token")).toBeNull();
+  });
+});
+
+describe("writeCacheRecord permissions", () => {
+  test("既存 cache directory を best-effort で 0700 に戻す", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "usage-core-perms-"));
+    tempDirs.push(dir);
+    await mkdir(dir, { recursive: true, mode: 0o755 });
+    await chmod(dir, 0o755);
+
+    await writeCacheRecord(join(dir, "cache.json"), existingRecord(1_000_000));
+
+    expect((await stat(dir)).mode & 0o777).toBe(0o700);
   });
 });
