@@ -25,6 +25,10 @@ This package is intended to be consumed from sibling repositories with a pinned 
 
 Display formatting, terminal integration, daemon lifecycle, and plugin entrypoints stay in each consumer repository.
 
+## Runtime Requirements
+
+This package intentionally exports TypeScript source and is designed for Bun-based consumers. Use Bun `>= 1.3.0`, or a consumer build step that can load the exported `.ts` files from the Git dependency.
+
 ## API
 
 Import public functions and types from the package root:
@@ -78,6 +82,7 @@ Expired cache reads can trigger synchronous fetches. When multiple consumers obs
 - fresh locks make other consumers skip starting another sync fetch
 - stale locks are recovered by mtime timeout
 - default `lockTimeoutMs` is 30 seconds
+- set `lockTimeoutMs` longer than the worst expected fetch duration for the consumer, otherwise a slow in-flight fetch can be mistaken for a stale lock
 
 If `lockFile` is omitted, `resolveUsageData` preserves the historical no-lock behavior.
 
