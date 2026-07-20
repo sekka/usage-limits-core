@@ -51,6 +51,7 @@ export interface CacheRecord {
 }
 
 export type KeychainFallback = () => Promise<string | null>;
+export type FetchImpl = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
 export interface FetchAndCacheArgs {
   cacheFile: string;
@@ -62,7 +63,7 @@ export interface FetchAndCacheArgs {
   timeoutMs?: number;
   defaultBackoffMs?: number;
   maxBackoffMs?: number;
-  fetchImpl?: typeof fetch;
+  fetchImpl?: FetchImpl;
 }
 
 export interface ResolveUsageArgs {
