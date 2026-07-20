@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { promisify } from "node:util";
 
@@ -68,6 +68,8 @@ export interface FetchAndCacheArgs {
 export interface ResolveUsageArgs {
   cacheFile: string;
   now?: number;
+  lockFile?: string;
+  lockTimeoutMs?: number;
   fetchAndCache: () => Promise<void>;
 }
 
@@ -301,6 +303,52 @@ export async function writeCacheRecord(cacheFile: string, record: CacheRecord): 
   await chmod(cacheFile, 0o600);
 }
 
+async function tryAcquireLock(args: {
+  lockFile: string;
+  now: number;
+  timeoutMs: number;
+}): Promise<boolean> {
+  await mkdir(dirname(args.lockFile), { recursive: true, mode: 0o700 });
+  try {
+    const handle = await open(args.lockFile, "wx", 0o600);
+    try {
+      await handle.writeFile(JSON.stringify({ pid: process.pid, createdAt: args.now }));
+    } finally {
+      await handle.close();
+    }
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "EEXIST") throw error;
+  }
+
+  try {
+    const info = await stat(args.lockFile);
+    if (args.now - info.mtimeMs <= args.timeoutMs) return false;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return tryAcquireLock(args);
+    throw error;
+  }
+
+  try {
+    await unlink(args.lockFile);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") throw error;
+  }
+  return tryAcquireLock(args);
+}
+
+async function releaseLock(lockFile: string): Promise<void> {
+  try {
+    await unlink(lockFile);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") throw error;
+  }
+}
+
 export async function fetchAndCacheUsage(args: FetchAndCacheArgs): Promise<void> {
   const now = args.now ?? Date.now();
   const defaultBackoffMs = args.defaultBackoffMs ?? 60_000;
@@ -368,9 +416,22 @@ export async function resolveUsageData(args: ResolveUsageArgs): Promise<Resolved
   });
 
   if (decision === "sync") {
-    try {
-      await args.fetchAndCache();
-    } catch {}
+    let acquired = true;
+    if (args.lockFile) {
+      acquired = await tryAcquireLock({
+        lockFile: args.lockFile,
+        now,
+        timeoutMs: args.lockTimeoutMs ?? 30_000,
+      });
+    }
+    if (acquired) {
+      try {
+        await args.fetchAndCache();
+      } catch {
+      } finally {
+        if (args.lockFile) await releaseLock(args.lockFile);
+      }
+    }
     cache = await readCacheFile(args.cacheFile, now);
   } else if (decision === "background") {
     args.fetchAndCache().catch(() => {});

@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -6,6 +6,7 @@ import {
   fetchAndCacheUsage,
   parseCache,
   readCacheFile,
+  resolveUsageData,
   shouldFetchNow,
   type CacheRecord,
   type UsageLimits,
@@ -192,5 +193,93 @@ describe("readCacheFile 読み込み時バリデーション (毒 cache)", () =>
     });
 
     expect(["background", "sync"]).toContain(decision);
+  });
+});
+
+describe("resolveUsageData stampede lock", () => {
+  const now = 1_000_000;
+
+  async function expiredCache(): Promise<{ cacheFile: string; lockFile: string }> {
+    const dir = await mkdtemp(join(tmpdir(), "usage-core-lock-"));
+    tempDirs.push(dir);
+    const cacheFile = join(dir, "cache.json");
+    const lockFile = join(dir, "cache.json.lock");
+    await writeFile(
+      cacheFile,
+      JSON.stringify({
+        data: {
+          five_hour: { utilization: 42, resets_at: null },
+          seven_day: null,
+        },
+        timestamp: now - 2 * 60 * 60 * 1000,
+        nextRetryAt: null,
+      } satisfies CacheRecord),
+    );
+    return { cacheFile, lockFile };
+  }
+
+  test("expired sync fetch は lockfile で 1 件だけ実行される", async () => {
+    const { cacheFile, lockFile } = await expiredCache();
+    let fetches = 0;
+    let releaseFetch: (() => void) | undefined;
+    const fetchGate = new Promise<void>((resolve) => {
+      releaseFetch = resolve;
+    });
+    const fetchAndCache = async (): Promise<void> => {
+      fetches += 1;
+      await fetchGate;
+      await writeFile(
+        cacheFile,
+        JSON.stringify({
+          data: { five_hour: { utilization: 99, resets_at: null }, seven_day: null },
+          timestamp: now,
+          nextRetryAt: null,
+        } satisfies CacheRecord),
+      );
+    };
+
+    const first = resolveUsageData({ cacheFile, lockFile, now, fetchAndCache });
+    const second = resolveUsageData({ cacheFile, lockFile, now, fetchAndCache });
+    await Bun.sleep(5);
+    releaseFetch?.();
+    await Promise.all([first, second]);
+
+    expect(fetches).toBe(1);
+  });
+
+  test("fresh lock がある間は expired sync fetch を開始しない", async () => {
+    const { cacheFile, lockFile } = await expiredCache();
+    await writeFile(lockFile, "other process");
+    let fetches = 0;
+
+    await resolveUsageData({
+      cacheFile,
+      lockFile,
+      now,
+      fetchAndCache: async () => {
+        fetches += 1;
+      },
+    });
+
+    expect(fetches).toBe(0);
+  });
+
+  test("stale lock は timeout 後に回収して sync fetch する", async () => {
+    const { cacheFile, lockFile } = await expiredCache();
+    await writeFile(lockFile, "dead process");
+    await utimes(lockFile, new Date(now - 120_000), new Date(now - 120_000));
+    let fetches = 0;
+
+    await resolveUsageData({
+      cacheFile,
+      lockFile,
+      now,
+      lockTimeoutMs: 60_000,
+      fetchAndCache: async () => {
+        fetches += 1;
+      },
+    });
+
+    expect(fetches).toBe(1);
   });
 });
